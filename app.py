@@ -7,6 +7,8 @@ import matplotlib.patches as mpatches
 import matplotlib.gridspec as gridspec
 from matplotlib.colors import LinearSegmentedColormap
 import matplotlib
+import requests
+import io
 matplotlib.use('Agg')
 
 st.set_page_config(
@@ -165,6 +167,46 @@ def habitability_factors(vals, derived):
         ('HZ Ratio',          f'{hz_ratio:.3f}',
          0.5 <= hz_ratio <= 2.0,      '0.5-2.0'),
     ]
+
+
+@st.cache_data(ttl=3600)
+def load_sample_data():
+    cols = "pl_name,hostname,pl_orbper,pl_rade,pl_masse,pl_orbsmax,pl_orbeccen,st_teff,st_rad,st_mass,sy_dist"
+    url  = (
+        "https://exoplanetarchive.ipac.caltech.edu/TAP/sync"
+        f"?query=select+top+50+{cols}+from+ps"
+        "&format=csv"
+    )
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text), comment='#')
+        base = ['pl_orbper', 'pl_rade', 'pl_masse', 'pl_orbsmax', 'pl_orbeccen',
+                'st_teff', 'st_rad', 'st_mass', 'sy_dist']
+        df = df.dropna(thresh=int(len(base) * 0.55)).reset_index(drop=True)
+
+        st_rad_s  = df['st_rad'].fillna(1.0).clip(lower=0.01)
+        st_teff_s = df['st_teff'].fillna(5778.0).clip(lower=500)
+        a_au_s    = df['pl_orbsmax'].clip(lower=1e-4)
+        st_rad_au = st_rad_s * 0.00465
+        luminosity = ((st_teff_s / 5778.0) ** 4) * (st_rad_s ** 2)
+        df['t_eq']         = st_teff_s * np.sqrt(st_rad_au / (2.0 * a_au_s)) * (0.7 ** 0.25)
+        df['stellar_flux'] = luminosity / (a_au_s ** 2)
+        hz_center          = np.sqrt(luminosity).clip(lower=1e-6)
+        df['hz_ratio']     = a_au_s / hz_center
+
+        t_eq_ok   = df['t_eq'].between(175, 340)
+        radius_ok = df['pl_rade'].between(0.5, 2.5)
+        flux_ok   = df['stellar_flux'].between(0.2, 2.5)
+        ecc_ok    = df['pl_orbeccen'].fillna(0.0) <= 0.4
+        star_ok   = df['st_teff'].between(3500, 7500)
+        mass_ok   = df['pl_masse'].fillna(df['pl_rade'] ** 2.5) <= 13.0
+        df['Habitable'] = (t_eq_ok & radius_ok & flux_ok & mass_ok & ecc_ok & star_ok).map(
+            {True: 'Yes', False: 'No'}
+        )
+        return df, None
+    except Exception as e:
+        return None, str(e)
 
 
 def make_probability_donut(hab_prob):
@@ -408,7 +450,7 @@ st.markdown(
 )
 st.markdown("---")
 
-tab1, tab2, tab3 = st.tabs(["Predict", "Feature Analysis", "Model Info"])
+tab1, tab2, tab3, tab4 = st.tabs(["Predict", "Feature Analysis", "Model Info", "Sample Data"])
 
 with tab1:
     st.subheader("Quick Presets")
@@ -532,6 +574,87 @@ with tab2:
             'Flux (Se)':   round(d['stellar_flux'], 3)
         })
     st.dataframe(pd.DataFrame(preset_rows), use_container_width=True, hide_index=True)
+
+with tab4:
+    st.subheader("Sample Data from NASA Exoplanet Archive")
+    st.caption(
+        "Live fetch of 50 planets from the NASA TAP API. "
+        "Derived columns (Equil. Temp, Stellar Flux, HZ Ratio) and habitability label "
+        "are computed on the fly using the same logic as the model."
+    )
+
+    sample_df, err = load_sample_data()
+
+    if err:
+        st.error(f"Could not fetch data from NASA archive: {err}")
+    else:
+        total   = len(sample_df)
+        n_hab   = (sample_df['Habitable'] == 'Yes').sum()
+        n_not   = total - n_hab
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Planets Shown", total)
+        m2.metric("Potentially Habitable", int(n_hab))
+        m3.metric("Not Habitable", int(n_not))
+
+        st.markdown("---")
+
+        DISPLAY_COLS = {
+            'pl_name':     'Planet Name',
+            'hostname':    'Host Star',
+            'pl_orbper':   'Orbital Period (days)',
+            'pl_rade':     'Radius (Re)',
+            'pl_masse':    'Mass (Me)',
+            'pl_orbsmax':  'Semi-major Axis (AU)',
+            'pl_orbeccen': 'Eccentricity',
+            'st_teff':     'Star Temp (K)',
+            'st_mass':     'Star Mass (Mo)',
+            'sy_dist':     'Distance (pc)',
+            't_eq':        'Equil. Temp (K)',
+            'stellar_flux':'Stellar Flux (Se)',
+            'hz_ratio':    'HZ Ratio',
+            'Habitable':   'Habitable',
+        }
+
+        display_df = sample_df[[c for c in DISPLAY_COLS if c in sample_df.columns]].copy()
+        display_df = display_df.rename(columns=DISPLAY_COLS)
+
+        for col in ['Orbital Period (days)', 'Radius (Re)', 'Mass (Me)',
+                    'Semi-major Axis (AU)', 'Eccentricity', 'Star Temp (K)',
+                    'Star Mass (Mo)', 'Distance (pc)']:
+            if col in display_df.columns:
+                display_df[col] = display_df[col].map(lambda v: f"{v:.3f}" if pd.notna(v) else "")
+
+        for col in ['Equil. Temp (K)', 'Stellar Flux (Se)', 'HZ Ratio']:
+            if col in display_df.columns:
+                display_df[col] = display_df[col].map(lambda v: f"{v:.3f}" if pd.notna(v) else "")
+
+        def highlight_habitable(row):
+            color = "#0d2318" if row.get('Habitable') == 'Yes' else ""
+            return [f"background-color: {color}" for _ in row]
+
+        styled = display_df.style.apply(highlight_habitable, axis=1)
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.subheader("Column Descriptions")
+        col_desc = pd.DataFrame([
+            ('Planet Name',          'Canonical planet identifier from NASA archive'),
+            ('Host Star',            'Name of the host star'),
+            ('Orbital Period (days)','Time for one full orbit around the host star'),
+            ('Radius (Re)',          'Planet radius relative to Earth'),
+            ('Mass (Me)',            'Planet mass relative to Earth'),
+            ('Semi-major Axis (AU)', 'Average orbital distance from the star in AU'),
+            ('Eccentricity',         'Orbital shape: 0 = circular, 1 = parabolic'),
+            ('Star Temp (K)',         'Effective surface temperature of the host star'),
+            ('Star Mass (Mo)',        'Host star mass relative to the Sun'),
+            ('Distance (pc)',         'Distance from Earth in parsecs'),
+            ('Equil. Temp (K)',       'Derived: estimated blackbody surface temperature'),
+            ('Stellar Flux (Se)',     'Derived: stellar energy flux relative to Earth'),
+            ('HZ Ratio',             'Derived: orbital distance / habitable zone center'),
+            ('Habitable',            'Derived: Yes if all 6 habitability criteria are met'),
+        ], columns=['Column', 'Description'])
+        st.dataframe(col_desc, use_container_width=True, hide_index=True)
 
 with tab3:
     st.subheader("Performance Charts")
